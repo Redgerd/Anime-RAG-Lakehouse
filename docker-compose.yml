@@ -1,0 +1,257 @@
+# ═══════════════════════════════════════════════════════════════
+# Anime Sentiment Lakehouse
+# Kafka | PyFlink | MinIO | Nessie | Prometheus | Grafana
+# ═══════════════════════════════════════════════════════════════
+
+networks:
+  lakehouse-net:
+    driver: bridge
+
+volumes:
+  kafka-data:
+  minio-data:
+  nessie-data:
+  prometheus-data:
+  grafana-data:
+
+services:
+  # ───────────────────────────────────────────────────────────────
+  # KAFKA (KRaft — no Zookeeper)
+  # ───────────────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka
+    hostname: kafka
+    networks:
+      - lakehouse-net
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qg"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_LOG_RETENTION_HOURS: 48
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "kafka-broker-api-versions",
+          "--bootstrap-server",
+          "localhost:9092",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka-init
+    networks:
+      - lakehouse-net
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command: |
+      "
+      sleep 5
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic anilist.activity.raw      --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic anilist.activity.enriched --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic anilist.activity.dlq      --partitions 1 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic anilist.sentiment.windows --partitions 3 --replication-factor 1
+      echo 'Topics created.'
+      "
+    restart: "no"
+
+  # ───────────────────────────────────────────────────────────────
+  # FLINK (Job Manager + Task Manager)
+  # ───────────────────────────────────────────────────────────────
+  flink-jobmanager:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: anime-flink:1.19
+    container_name: flink-jobmanager
+    hostname: flink-jobmanager
+    networks:
+      - lakehouse-net
+    ports:
+      - "8081:8081" # Flink Web UI
+      - "9249:9249" # Prometheus metrics
+    command: jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        jobmanager.memory.process.size: 1600m
+        parallelism.default: 2
+        execution.checkpointing.interval: 60000
+        execution.checkpointing.mode: EXACTLY_ONCE
+        state.backend: rocksdb
+        state.checkpoints.dir: s3://checkpoints/flink
+        state.savepoints.dir: s3://checkpoints/savepoints
+    depends_on:
+      kafka:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      nessie:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/overview"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+    volumes:
+      - .:/opt/flink/jobs
+
+  flink-taskmanager:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: anime-flink:1.19
+    container_name: flink-taskmanager
+    hostname: flink-taskmanager
+    networks:
+      - lakehouse-net
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        taskmanager.memory.process.size: 2048m
+    depends_on:
+      - flink-jobmanager
+    volumes:
+      - .:/opt/flink/jobs
+
+  # ───────────────────────────────────────────────────────────────
+  # MINIO (object store)
+  # ───────────────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    hostname: minio
+    networks:
+      - lakehouse-net
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # Web Console
+    volumes:
+      - minio-data:/data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    networks:
+      - lakehouse-net
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      "
+      mc alias set local http://minio:9000 minioadmin minioadmin123
+      mc mb --ignore-existing local/lakehouse
+      mc mb --ignore-existing local/checkpoints
+      echo 'Buckets ready.'
+      "
+    restart: "no"
+
+  # ───────────────────────────────────────────────────────────────
+  # NESSIE (Iceberg catalog)
+  # ───────────────────────────────────────────────────────────────
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.74.0
+    container_name: nessie
+    hostname: nessie
+    restart: on-failure
+    networks:
+      - lakehouse-net
+    ports:
+      - "19120:19120"
+    volumes:
+      - nessie-data:/nessie/data
+    environment:
+      NESSIE_VERSION_STORE_TYPE: "ROCKS"
+      NESSIE_STORE_ROCKS_DB_PATH: "/nessie/data/rocks"
+      NESSIE_SERVER_AUTHENTICATION_ENABLED: "false"
+      NESSIE_CATALOG_DEFAULT_WAREHOUSE: "s3://lakehouse/warehouse"
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ENDPOINT: "http://minio:9000/"
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_PATH_STYLE_ACCESS: "true"
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ACCESS_KEY_ID: "minioadmin"
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_SECRET_ACCESS_KEY: "minioadmin123"
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_REGION: "us-east-1"
+    depends_on:
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:19120/api/v2/config"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  # ───────────────────────────────────────────────────────────────
+  # PROMETHEUS
+  # ───────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    container_name: prometheus
+    networks:
+      - lakehouse-net
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      [
+        "--config.file=/etc/prometheus/prometheus.yml",
+        "--storage.tsdb.retention.time=7d",
+      ]
+    depends_on:
+      - flink-jobmanager
+      - kafka
+
+  # ───────────────────────────────────────────────────────────────
+  # GRAFANA
+  # ───────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: grafana
+    networks:
+      - lakehouse-net
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana-datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml:ro
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin123
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    depends_on:
+      - prometheus

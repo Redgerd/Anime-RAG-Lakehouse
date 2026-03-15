@@ -1,0 +1,10 @@
+apache-flink==1.19.0
+kafka-python==2.0.2
+vaderSentiment==3.3.2
+textblob==0.18.0
+pyiceberg[s3,nessie]==0.7.1
+pydantic==2.7.1
+prometheus-client==0.20.0
+python-dotenv==1.0.1
+structlog==24.1.0
+tenacity==8.3.0
