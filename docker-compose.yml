@@ -1,6 +1,6 @@
 # ═══════════════════════════════════════════════════════════════
 # Anime Sentiment Lakehouse
-# Kafka | PyFlink | MinIO | Nessie | Prometheus | Grafana
+# Kafka | PyFlink | MinIO | Nessie | Prometheus | Grafana | Producer
 # ═══════════════════════════════════════════════════════════════
 
 networks:
@@ -37,7 +37,7 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
       KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
       KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
-      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qg"
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID}
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       KAFKA_DEFAULT_REPLICATION_FACTOR: 1
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
@@ -69,10 +69,10 @@ services:
     command: |
       "
       sleep 5
-      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic anilist.activity.raw      --partitions 3 --replication-factor 1
-      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic anilist.activity.enriched --partitions 3 --replication-factor 1
-      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic anilist.activity.dlq      --partitions 1 --replication-factor 1
-      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic anilist.sentiment.windows --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic ${KAFKA_TOPIC_RAW}      --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic ${KAFKA_TOPIC_ENRICHED} --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic ${KAFKA_TOPIC_DLQ}      --partitions 1 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic ${KAFKA_TOPIC_WINDOWS}  --partitions 3 --replication-factor 1
       echo 'Topics created.'
       "
     restart: "no"
@@ -90,8 +90,8 @@ services:
     networks:
       - lakehouse-net
     ports:
-      - "8081:8081" # Flink Web UI
-      - "9249:9249" # Prometheus metrics
+      - "8081:8081"
+      - "9249:9249"
     command: jobmanager
     environment:
       FLINK_PROPERTIES: |
@@ -101,8 +101,8 @@ services:
         execution.checkpointing.interval: 60000
         execution.checkpointing.mode: EXACTLY_ONCE
         state.backend: rocksdb
-        state.checkpoints.dir: s3://checkpoints/flink
-        state.savepoints.dir: s3://checkpoints/savepoints
+        state.checkpoints.dir: s3://${MINIO_BUCKET_CHECKPOINTS}/flink
+        state.savepoints.dir: s3://${MINIO_BUCKET_CHECKPOINTS}/savepoints
     depends_on:
       kafka:
         condition: service_healthy
@@ -148,13 +148,13 @@ services:
     networks:
       - lakehouse-net
     ports:
-      - "9000:9000" # S3 API
-      - "9001:9001" # Web Console
+      - "9000:9000"
+      - "9001:9001"
     volumes:
       - minio-data:/data
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin123
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     command: server /data --console-address ":9001"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
@@ -173,9 +173,9 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command: |
       "
-      mc alias set local http://minio:9000 minioadmin minioadmin123
-      mc mb --ignore-existing local/lakehouse
-      mc mb --ignore-existing local/checkpoints
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD}
+      mc mb --ignore-existing local/${MINIO_BUCKET_LAKEHOUSE}
+      mc mb --ignore-existing local/${MINIO_BUCKET_CHECKPOINTS}
       echo 'Buckets ready.'
       "
     restart: "no"
@@ -198,11 +198,11 @@ services:
       NESSIE_VERSION_STORE_TYPE: "ROCKS"
       NESSIE_STORE_ROCKS_DB_PATH: "/nessie/data/rocks"
       NESSIE_SERVER_AUTHENTICATION_ENABLED: "false"
-      NESSIE_CATALOG_DEFAULT_WAREHOUSE: "s3://lakehouse/warehouse"
+      NESSIE_CATALOG_DEFAULT_WAREHOUSE: "s3://${MINIO_BUCKET_LAKEHOUSE}/warehouse"
       NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ENDPOINT: "http://minio:9000/"
       NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_PATH_STYLE_ACCESS: "true"
-      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ACCESS_KEY_ID: "minioadmin"
-      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_SECRET_ACCESS_KEY: "minioadmin123"
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
       NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_REGION: "us-east-1"
     depends_on:
       minio:
@@ -213,6 +213,29 @@ services:
       timeout: 5s
       retries: 20
       start_period: 60s
+
+  # ───────────────────────────────────────────────────────────────
+  # PRODUCER (AniList polling service)
+  # ───────────────────────────────────────────────────────────────
+  producer:
+    build:
+      context: ./producer
+      dockerfile: Dockerfile
+    container_name: producer
+    volumes:
+      - ./producer:/app
+    networks:
+      - lakehouse-net
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC_RAW: ${KAFKA_TOPIC_RAW}
+      KAFKA_TOPIC_DLQ: ${KAFKA_TOPIC_DLQ}
+      ANILIST_MEDIA_ID: ${ANILIST_MEDIA_ID}
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
 
   # ───────────────────────────────────────────────────────────────
   # PROMETHEUS
@@ -250,8 +273,8 @@ services:
       - grafana-data:/var/lib/grafana
       - ./grafana-datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml:ro
     environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin123
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
       GF_USERS_ALLOW_SIGN_UP: "false"
     depends_on:
       - prometheus
