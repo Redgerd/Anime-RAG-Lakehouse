@@ -1,7 +1,42 @@
+# ── Secrets ───────────────────────────────────────────────────
 .env
+
+# ── Python ────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 *.egg-info/
+.eggs/
+dist/
+build/
+*.whl
+
+# ── Virtual environments ──────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── Docker volumes (if accidentally created locally) ──────────
+kafka-data/
+minio-data/
+nessie-data/
+prometheus-data/
+grafana-data/
+
+# ── VS Code ───────────────────────────────────────────────────
+.vscode/
+*.code-workspace
+
+# ── OS junk ───────────────────────────────────────────────────
 .DS_Store
-.docx
+Thumbs.db
+desktop.ini
+
+# ── Logs ──────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Jupyter ───────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
