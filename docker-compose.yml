@@ -116,7 +116,7 @@ services:
       timeout: 10s
       retries: 10
     volumes:
-      - .:/opt/flink/jobs
+      - ./jobs:/opt/flink/jobs
 
   flink-taskmanager:
     build:
@@ -136,7 +136,7 @@ services:
     depends_on:
       - flink-jobmanager
     volumes:
-      - .:/opt/flink/jobs
+      - ./jobs:/opt/flink/jobs
 
   # ───────────────────────────────────────────────────────────────
   # MINIO (object store)

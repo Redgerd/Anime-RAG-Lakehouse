@@ -53,7 +53,10 @@ RUN echo "s3.endpoint: http://minio:9000"        >> $FLINK_HOME/conf/flink-conf.
     echo "metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory" >> $FLINK_HOME/conf/flink-conf.yaml && \
     echo "metrics.reporter.prom.port: 9249"      >> $FLINK_HOME/conf/flink-conf.yaml
 
-ENV PYFLINK_PYTHON=/usr/bin/python3
+RUN chown -R flink:flink $FLINK_HOME/conf && \
+    chmod -R 755 $FLINK_HOME/conf
+
+    ENV PYFLINK_PYTHON=/usr/bin/python3
 
 WORKDIR /opt/flink/jobs
 
